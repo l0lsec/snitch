@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snitch"
+version = "0.1.0"
+description = "Scan locally-installed tools and packages for known-malicious or suspicious code."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "snitch contributors" }]
+keywords = ["security", "supply-chain", "malware", "scanner", "osv"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "sqlite-utils>=3.36",
+    "platformdirs>=4.2",
+    "packaging>=24.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+ast = [
+    "tree-sitter>=0.21",
+    "tree-sitter-javascript>=0.21",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+snitch = "snitch.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/your-handle/snitch"
+Issues = "https://github.com/your-handle/snitch/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snitch"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer requires `typer.Option(...)` in argument defaults
+"src/snitch/cli.py" = ["B008"]
+"tests/*" = ["B011", "S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
