@@ -25,6 +25,21 @@ VENV_GLOBS = (
     "~/Library/Caches/pypoetry/virtualenvs/*",
 )
 
+# Per-user "site-packages" trees that aren't venvs. Each entry already points
+# at a directory whose subpaths look like ``pythonX.Y/site-packages`` (macOS
+# user-site) or ``site-packages`` directly (Linux user-site, Homebrew, etc.).
+# These catch packages installed via ``pip install --user`` or shipped with
+# the system / Homebrew Python -- which is where vulnerable copies of pip
+# itself often live.
+USER_SITE_ROOTS = (
+    "~/Library/Python",                 # macOS: ~/Library/Python/<X.Y>/lib/python/site-packages
+    "~/.local/lib",                     # Linux: ~/.local/lib/pythonX.Y/site-packages
+    "/opt/homebrew/lib",                # Apple-silicon Homebrew
+    "/usr/local/lib",                   # Intel Homebrew & many Linux distros
+    "/opt/homebrew/Frameworks/Python.framework/Versions",  # Homebrew framework
+    "/Library/Frameworks/Python.framework/Versions",       # python.org installer
+)
+
 
 class PipCollector(Collector):
     ecosystem = Ecosystem.PYPI
@@ -127,6 +142,22 @@ class PipCollector(Collector):
             for env in conda_envs.iterdir():
                 for py in (env / "lib").glob("python*/site-packages"):
                     candidates.add(py)
+        # Per-user / system site-packages outside venvs (pip --user, Homebrew,
+        # Apple/python.org-bundled Pythons). Each USER_SITE_ROOTS entry can
+        # contain ``pythonX.Y/site-packages`` and/or ``X.Y/lib/python*/site-packages``.
+        for root in USER_SITE_ROOTS:
+            base = Path(os.path.expanduser(root))
+            if not base.exists() or not base.is_dir():
+                continue
+            for sp in base.glob("python*/site-packages"):
+                if sp.is_dir():
+                    candidates.add(sp)
+            for sp in base.glob("*/lib/python*/site-packages"):
+                if sp.is_dir():
+                    candidates.add(sp)
+            for sp in base.glob("*/lib/python/site-packages"):  # macOS user-site quirk
+                if sp.is_dir():
+                    candidates.add(sp)
         return [c for c in candidates if c.exists()]
 
     def _pipx_apps(self) -> dict:
