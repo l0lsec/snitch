@@ -59,3 +59,37 @@ def test_intel_corroboration_upgrades_severity() -> None:
     )
     score_findings([advisory, heuristic])
     assert heuristic.severity >= Severity.HIGH
+
+
+def test_multiple_medium_advisories_stay_medium() -> None:
+    """Three OSV advisories on the same package are not corroboration of
+    each other. Each one's severity must reflect what its source reports;
+    stacking three mediums must NOT yield a critical.
+    """
+    pkg = _pkg()
+    advisories = [
+        Finding(pkg, f"osv.advisory.{i}", f"GHSA-{i}", Severity.MEDIUM, "",
+                [Evidence("advisory", f"GHSA-{i}", source="osv.dev")])
+        for i in range(3)
+    ]
+    score_findings(advisories)
+    for f in advisories:
+        assert f.severity == Severity.MEDIUM
+
+
+def test_intel_ceiling_caps_heuristic_upgrade() -> None:
+    """A heuristic finding on a package whose only intel is a MEDIUM
+    advisory must not be promoted past MEDIUM -- the advisory itself is
+    the ceiling.
+    """
+    pkg = _pkg()
+    advisory = Finding(
+        pkg, "osv.advisory", "GHSA-X", Severity.MEDIUM, "",
+        [Evidence("advisory", "GHSA-X", source="osv.dev")],
+    )
+    heuristic = Finding(
+        pkg, "rule.x", "x", Severity.LOW, "", [Evidence("ast", "y")]
+    )
+    score_findings([advisory, heuristic])
+    assert advisory.severity == Severity.MEDIUM
+    assert heuristic.severity == Severity.MEDIUM

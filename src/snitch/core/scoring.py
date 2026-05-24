@@ -38,14 +38,19 @@ def score_finding(finding: Finding) -> int:
 
 
 def score_findings(findings: Iterable[Finding]) -> None:
-    """Set ``score`` and upgrade severity when intel signals corroborate.
+    """Set ``score`` and (carefully) upgrade severity when corroborated.
 
-    Earlier versions promoted *any* package to CRITICAL once its findings
-    accumulated a high enough total score. That made every mature library
-    look critical because static AST/IOC hits stack quickly. We now only
-    promote when at least one finding in the same package has intel-class
-    evidence (advisory / malicious-packages); heuristics alone can never
-    auto-promote.
+    A finding's severity must always reflect what its own evidence actually
+    reports. In particular, multiple OSV advisories on the same package are
+    *not* corroboration of each other -- each one already carries the
+    severity assigned by the upstream database, and stacking them must not
+    silently promote mediums to critical.
+
+    We therefore only escalate a finding's severity when an *independent*
+    heuristic signal (``ast``/``ioc``/``rule``) lands on the same package as
+    intel-class evidence (``advisory``/``malicious-packages``). Even then we
+    cap the upgrade at ``HIGH`` and never above any advisory's reported
+    severity for that package.
     """
 
     findings = list(findings)
@@ -59,16 +64,24 @@ def score_findings(findings: Iterable[Finding]) -> None:
     for pkg_findings in by_pkg.values():
         if len(pkg_findings) < 2:
             continue
-        has_intel = any(
-            ev.kind in INTEL_EVIDENCE_KINDS for f in pkg_findings for ev in f.evidence
-        )
-        if not has_intel:
+
+        evidence_kinds = {
+            ev.kind for f in pkg_findings for ev in f.evidence
+        }
+        has_intel = bool(evidence_kinds & INTEL_EVIDENCE_KINDS)
+        has_heuristic = bool(evidence_kinds & {"ast", "ioc", "rule"})
+        if not (has_intel and has_heuristic):
             continue
-        total = sum(f.score for f in pkg_findings)
-        if total >= 120:
-            for f in pkg_findings:
-                if f.severity < Severity.HIGH:
-                    f.severity = Severity.HIGH
-        if total >= 200:
-            for f in pkg_findings:
-                f.severity = Severity.CRITICAL
+
+        # Cap any escalation at the highest severity reported by intel
+        # evidence on this package -- never invent a severity higher than
+        # what an advisory itself states.
+        intel_ceiling = max(
+            (f.severity for f in pkg_findings
+             if any(ev.kind in INTEL_EVIDENCE_KINDS for ev in f.evidence)),
+            default=Severity.MEDIUM,
+        )
+        target = min(Severity.HIGH, intel_ceiling)
+        for f in pkg_findings:
+            if f.severity < target:
+                f.severity = target

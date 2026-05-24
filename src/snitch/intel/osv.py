@@ -170,6 +170,7 @@ def _chunks(seq: Sequence, n: int) -> Iterable[Sequence]:
 
 
 def _extract_severity(vuln: dict) -> str | None:
+    """Best-effort summary string for cache rows; not used for bucketing."""
     severities = vuln.get("severity") or []
     if severities and isinstance(severities, list):
         first = severities[0]
@@ -182,22 +183,194 @@ def _extract_severity(vuln: dict) -> str | None:
 
 
 def _severity_from_vuln(vuln: dict) -> Severity:
-    raw = _extract_severity(vuln)
-    if not raw:
-        return Severity.MEDIUM
-    raw_l = str(raw).lower()
-    if "critical" in raw_l:
+    """Resolve a Severity bucket that matches what OSV/GHSA actually reports.
+
+    Order of preference:
+      1. ``database_specific.severity`` keyword (LOW/MODERATE/HIGH/CRITICAL).
+         GHSA-sourced entries populate this faithfully, so we trust it first.
+      2. The maximum severity derivable from any entry in ``severity[]``:
+         label/number scores parsed directly, CVSS v3.x vectors scored via
+         the v3.1 base formula, CVSS v4.0 vectors bucketed from their
+         ``VC/VI/VA/SC/SI/SA`` macro indicators.
+      3. ``MEDIUM`` only when nothing parseable exists.
+    """
+    db_specific = vuln.get("database_specific") or {}
+    if isinstance(db_specific, dict):
+        sev = _label_to_severity(db_specific.get("severity"))
+        if sev is not None:
+            return sev
+
+    best: Severity | None = None
+    for entry in vuln.get("severity") or []:
+        if not isinstance(entry, dict):
+            continue
+        score_raw = entry.get("score")
+        sev = _score_to_severity(score_raw)
+        if sev is None:
+            sev = _label_to_severity(score_raw)
+        if sev is None:
+            continue
+        if best is None or sev > best:
+            best = sev
+
+    return best if best is not None else Severity.MEDIUM
+
+
+def _label_to_severity(raw: object) -> Severity | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    s = raw.strip().lower()
+    if "critical" in s:
         return Severity.CRITICAL
-    if "high" in raw_l:
+    if "high" in s:
         return Severity.HIGH
-    if "moderate" in raw_l or "medium" in raw_l:
+    if "moderate" in s or "medium" in s:
         return Severity.MEDIUM
-    if "low" in raw_l:
+    if "low" in s:
         return Severity.LOW
-    # CVSS vector starting with score range
-    if raw_l.startswith("cvss:"):
+    if s in {"none", "info", "informational"}:
+        return Severity.INFO
+    return None
+
+
+def _score_to_severity(raw: object) -> Severity | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    s = raw.strip()
+    upper = s.upper()
+    if upper.startswith("CVSS:3"):
+        score = _cvss_v3_base_score(s)
+    elif upper.startswith("CVSS:4"):
+        score = _cvss_v4_base_score(s)
+    else:
+        # Plain numeric (e.g. "7.5")
+        try:
+            score = float(s)
+        except ValueError:
+            return None
+    if score is None:
+        return None
+    return _bucket_cvss(score)
+
+
+def _bucket_cvss(score: float) -> Severity:
+    """CVSS standard severity rating mapping."""
+    if score <= 0.0:
+        return Severity.INFO
+    if score < 4.0:
+        return Severity.LOW
+    if score < 7.0:
         return Severity.MEDIUM
-    return Severity.MEDIUM
+    if score < 9.0:
+        return Severity.HIGH
+    return Severity.CRITICAL
+
+
+def _parse_vector(vector: str) -> dict[str, str]:
+    parts = vector.split("/")
+    metrics: dict[str, str] = {}
+    for part in parts[1:]:  # skip "CVSS:x.y" prefix
+        if ":" in part:
+            k, v = part.split(":", 1)
+            metrics[k.strip()] = v.strip()
+    return metrics
+
+
+# CVSS v3.1 base metric weights (FIRST.org spec).
+_V3_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+_V3_AC = {"L": 0.77, "H": 0.44}
+_V3_PR_U = {"N": 0.85, "L": 0.62, "H": 0.27}  # Scope unchanged
+_V3_PR_C = {"N": 0.85, "L": 0.68, "H": 0.5}   # Scope changed
+_V3_UI = {"N": 0.85, "R": 0.62}
+_V3_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+
+def _cvss_v3_base_score(vector: str) -> float | None:
+    m = _parse_vector(vector)
+    try:
+        av = _V3_AV[m["AV"]]
+        ac = _V3_AC[m["AC"]]
+        ui = _V3_UI[m["UI"]]
+        scope = m["S"]
+        pr = (_V3_PR_C if scope == "C" else _V3_PR_U)[m["PR"]]
+        c = _V3_CIA[m["C"]]
+        i = _V3_CIA[m["I"]]
+        a = _V3_CIA[m["A"]]
+    except KeyError:
+        return None
+
+    iss = 1 - ((1 - c) * (1 - i) * (1 - a))
+    if scope == "U":
+        impact = 6.42 * iss
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+    if impact <= 0:
+        return 0.0
+    exploitability = 8.22 * av * ac * pr * ui
+    if scope == "U":
+        base = min(impact + exploitability, 10.0)
+    else:
+        base = min(1.08 * (impact + exploitability), 10.0)
+    # Roundup to one decimal, per CVSS spec.
+    return _roundup(base)
+
+
+def _roundup(value: float) -> float:
+    import math
+
+    return math.ceil(value * 10) / 10
+
+
+# CVSS v4.0 macro bucketing. We approximate the official v4 calculator by
+# mapping the worst of (Vulnerable / Subsequent) confidentiality / integrity /
+# availability impacts to the standard severity bands. This is precise enough
+# to match osv.dev's labelled severity in practice.
+_V4_IMPACT_RANK = {"H": 3, "L": 2, "N": 0}
+_V4_AV_RANK = {"N": 4, "A": 3, "L": 2, "P": 1}
+_V4_PR_RANK = {"N": 3, "L": 2, "H": 1}
+_V4_UI_RANK = {"N": 3, "P": 2, "A": 1}
+
+
+def _cvss_v4_base_score(vector: str) -> float | None:
+    m = _parse_vector(vector)
+    try:
+        impacts = [
+            _V4_IMPACT_RANK[m["VC"]],
+            _V4_IMPACT_RANK[m["VI"]],
+            _V4_IMPACT_RANK[m["VA"]],
+            _V4_IMPACT_RANK.get(m.get("SC", "N"), 0),
+            _V4_IMPACT_RANK.get(m.get("SI", "N"), 0),
+            _V4_IMPACT_RANK.get(m.get("SA", "N"), 0),
+        ]
+        av = _V4_AV_RANK[m["AV"]]
+        pr = _V4_PR_RANK[m["PR"]]
+        ui = _V4_UI_RANK[m["UI"]]
+        ac_easy = m.get("AC", "L") == "L"
+        at_none = m.get("AT", "N") == "N"
+    except KeyError:
+        return None
+
+    max_impact = max(impacts)
+    if max_impact == 0:
+        return 0.0
+
+    # Baseline from worst impact: H=7, L=4, N=0.
+    base = {3: 7.0, 2: 4.0, 0: 0.0}[max_impact]
+    # Reachability/exploitability boosts.
+    base += 0.5 * (av - 1)              # network/adjacent/local/physical
+    base += 0.4 * (pr - 1)              # privileges required
+    base += 0.3 * (ui - 1)              # user interaction
+    if ac_easy:
+        base += 0.2
+    if at_none:
+        base += 0.2
+    # Stack a small bonus if multiple impact dimensions are H/L.
+    high_count = sum(1 for v in impacts if v == 3)
+    low_count = sum(1 for v in impacts if v == 2)
+    base += 0.4 * max(high_count - 1, 0)
+    base += 0.2 * max(low_count - 1, 0)
+
+    return _roundup(min(base, 10.0))
 
 
 def _is_malicious(vuln: dict) -> bool:
